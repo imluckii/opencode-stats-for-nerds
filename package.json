@@ -1,6 +1,6 @@
 {
   "name": "oc-stats-for-nerds",
-  "version": "4.1.0",
+  "version": "1.0.0",
   "description": "Shows token/speed/cost stats — live sidebar widget + final stats after agent finishes",
   "author": "imluckii",
   "license": "MIT",
