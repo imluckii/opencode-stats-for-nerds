@@ -1,312 +1,263 @@
 /** @jsxImportSource @opentui/solid */
-import type { TuiPlugin, TuiPluginModule, TuiThemeCurrent } from "@opencode-ai/plugin/tui"
-import { createSignal, Show, onCleanup, createMemo } from "solid-js"
-
-interface SessionMessage {
-  role: string
-  modelID?: string
-  providerID?: string
-  cost?: number
-  tokens?: {
-    input?: number
-    output?: number
-    reasoning?: number
-    cache?: { read?: number; write?: number }
-  }
-}
-
-interface SessionInfo {
-  id: string
-  cost?: number
-  model?: { id: string }
-  time?: { created?: number; updated?: number }
-}
+import type { TuiPlugin, TuiPluginModule } from "@opencode-ai/plugin/tui"
+import { createSignal, Show, onCleanup, createMemo, For } from "solid-js"
 
 const PLUGIN_ID = "oc-stats-for-nerds"
+
+// ── Helpers ──
 
 function fmt(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`
   if (n >= 10_000) return `${(n / 1_000).toFixed(0)}k`
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`
-  return n.toString()
+  return String(n)
 }
 
-function fmtTps(tps: number): string {
-  if (tps >= 100) return tps.toFixed(0)
-  if (tps >= 10) return tps.toFixed(1)
-  return tps.toFixed(2)
+function fmtCost(n: number): string {
+  if (n === 0) return "$0.00"
+  if (n < 0.01) return "$" + n.toFixed(4)
+  return "$" + n.toFixed(2)
+}
+
+function fmtTps(n: number): string {
+  if (n >= 100) return n.toFixed(0)
+  if (n >= 10) return n.toFixed(1)
+  return n.toFixed(2)
+}
+
+function fmtDur(ms: number): string {
+  const s = ms / 1000
+  if (s < 60) return `${s.toFixed(1)}s`
+  const m = Math.floor(s / 60)
+  return `${m}m ${Math.floor(s % 60)}s`
 }
 
 function pad(str: string, width: number): string {
   const s = String(str)
-  if (s.length >= width) return s
-  return s + " ".repeat(width - s.length)
+  return s.length >= width ? s : s + " ".repeat(width - s.length)
 }
 
-interface Stats {
-  inputTokens: number
-  outputTokens: number
-  reasoningTokens: number
-  cacheRead: number
-  contextSize: number
+// ── Stats computation ──
+
+interface TurnStats {
+  // last response stats
+  lastInput: number
+  lastOutput: number
+  lastReasoning: number
+  lastCacheRead: number
+  lastCacheWrite: number
+  lastContext: number
+  lastCost: number
+  lastModel: string
+  lastDurationMs: number
+  lastTps: number
+  // session totals
+  totalOutput: number
   totalCost: number
-  model: string
+  turnCount: number
 }
 
-function computeStats(
-  messages: SessionMessage[],
-  session: SessionInfo | undefined,
-): Stats | null {
-  const assistants = messages.filter((m) => m.role === "assistant")
-  if (assistants.length === 0) return null
-  const last = assistants[assistants.length - 1]
-  if (!last.tokens) return null
+interface RawMessage {
+  info: {
+    role: string
+    modelID?: string
+    providerID?: string
+    cost?: number
+    tokens?: {
+      total?: number
+      input?: number
+      output?: number
+      reasoning?: number
+      cache?: { read?: number; write?: number }
+    }
+    time?: { created?: number; completed?: number }
+  }
+}
 
-  const tk = last.tokens
-  const contextSize =
+function computeTurnStats(messages: RawMessage[], sessionCost: number): TurnStats | null {
+  const assistants = messages
+    .filter((m) => m.info?.role === "assistant" && m.info?.tokens)
+    .map((m) => m.info)
+
+  if (assistants.length === 0) return null
+
+  const last = assistants[assistants.length - 1]
+  const tk = last.tokens!
+
+  const lastContext =
     (tk.input || 0) + (tk.output || 0) + (tk.reasoning || 0) +
     (tk.cache?.read || 0) + (tk.cache?.write || 0)
 
+  // Duration and TPS from timestamps
+  let lastDurationMs = 0
+  let lastTps = 0
+  if (last.time?.created && last.time?.completed) {
+    lastDurationMs = last.time.completed - last.time.created
+    if (lastDurationMs > 0) {
+      lastTps = (tk.output || 0) / (lastDurationMs / 1000)
+    }
+  }
+
+  // Session totals
   let totalOutput = 0
-  let totalReasoning = 0
+  let totalCost = 0
   for (const m of assistants) {
     totalOutput += m.tokens?.output || 0
-    totalReasoning += m.tokens?.reasoning || 0
+    totalCost += m.cost || 0
   }
 
   return {
-    inputTokens: tk.input || 0,
-    outputTokens: totalOutput,
-    reasoningTokens: totalReasoning,
-    cacheRead: tk.cache?.read || 0,
-    contextSize,
-    totalCost: session?.cost ?? 0,
-    model: last.modelID || "unknown",
+    lastInput: tk.input || 0,
+    lastOutput: tk.output || 0,
+    lastReasoning: tk.reasoning || 0,
+    lastCacheRead: tk.cache?.read || 0,
+    lastCacheWrite: tk.cache?.write || 0,
+    lastContext,
+    lastCost: last.cost || 0,
+    lastModel: last.modelID || "unknown",
+    lastDurationMs,
+    lastTps,
+    totalOutput,
+    totalCost: sessionCost || totalCost,
+    turnCount: assistants.length,
   }
 }
 
-// ── View Component ──
-// IMPORTANT: SolidJS rules — component function runs ONCE.
-// Signals must be read inside JSX {} for reactivity.
-// Use <Show> for conditionals, never early return.
+// ── View ──
 
-function StatsView(props: {
-  api: Parameters<TuiPlugin>[0]
-  sessionID: string
-}) {
+function StatsView(props: { api: Parameters<TuiPlugin>[0]; sessionID: string }) {
   const theme = () => props.api.theme.current
 
   const [collapsed, setCollapsed] = createSignal(false)
-  const [tps, setTps] = createSignal(0)
-  const [generating, setGenerating] = createSignal(false)
   const [version, setVersion] = createSignal(0)
+  const bump = () => setVersion((v) => v + 1)
 
-  // TPS tracking
-  let lastSampleTime = 0
-  let lastSampleTokens = 0
-  let idleTimer: ReturnType<typeof setTimeout> | null = null
-
-  function refresh() {
-    const msgs = props.api.state.session.messages(props.sessionID) as unknown as SessionMessage[] || []
-    const assistants = msgs.filter((m) => m.role === "assistant")
-    if (!assistants.length) return
-
-    const last = assistants[assistants.length - 1]
-    const currentOutput = last.tokens?.output || 0
-
-    // Detect new tokens being generated
-    if (currentOutput > lastSampleTokens) {
-      const now = Date.now()
-      if (lastSampleTime > 0) {
-        const dt = (now - lastSampleTime) / 1000
-        const dTokens = currentOutput - lastSampleTokens
-        if (dt > 0.05 && dTokens > 0) {
-          const instant = dTokens / dt
-          setTps((prev) => (prev === 0 ? instant : prev * 0.3 + instant * 0.7))
-        }
-      }
-      lastSampleTime = now
-      lastSampleTokens = currentOutput
-      setGenerating(true)
-
-      if (idleTimer) clearTimeout(idleTimer)
-      idleTimer = setTimeout(() => setGenerating(false), 2000)
-    }
-
-    setVersion((v) => v + 1)
-  }
-
-  // Live event subscriptions
-  const stopPart = props.api.event.on("message.part.updated", (event) => {
-    const sid = (event.properties as { sessionID?: string }).sessionID
+  // Event subscriptions
+  const stop1 = props.api.event.on("message.updated", (e) => {
+    if ((e.properties as any).sessionID !== props.sessionID) return
+    bump()
+  })
+  const stop2 = props.api.event.on("message.part.updated", (e) => {
+    if ((e.properties as any).sessionID !== props.sessionID) return
+    bump()
+  })
+  const stop3 = props.api.event.on("session.idle", (e) => {
+    const sid = (e.properties as any).id || (e.properties as any).sessionID
     if (sid !== props.sessionID) return
-    refresh()
+    bump()
   })
 
-  const stopMsg = props.api.event.on("message.updated", (event) => {
-    const sid = (event.properties as { sessionID?: string }).sessionID
-    if (sid !== props.sessionID) return
-    refresh()
-  })
+  onCleanup(() => { stop1(); stop2(); stop3() })
 
-  const stopIdle = props.api.event.on("session.idle", (event) => {
-    const sid = (event.properties as { id?: string }).id ||
-                (event.properties as { sessionID?: string }).sessionID
-    if (sid !== props.sessionID) return
-    setGenerating(false)
-    lastSampleTime = 0
-    lastSampleTokens = 0
-    setVersion((v) => v + 1)
-  })
-
-  // Periodic refresh — keeps TPS display live and decays when idle
-  const interval = setInterval(() => {
-    if (!generating()) {
-      setTps((prev) => (prev > 1 ? prev * 0.85 : 0))
-    }
-    setVersion((v) => v + 1)
-  }, 300)
-
-  onCleanup(() => {
-    stopPart()
-    stopMsg()
-    stopIdle()
-    clearInterval(interval)
-    if (idleTimer) clearTimeout(idleTimer)
-  })
-
-  // Stats memo — re-evaluates when version() changes
-  const stats = createMemo<Stats | null>(() => {
-    version()
-    const msgs = props.api.state.session.messages(props.sessionID) as unknown as SessionMessage[] || []
-    const session = props.api.state.session.get(props.sessionID) as unknown as SessionInfo | undefined
-    return computeStats(msgs, session)
+  const stats = createMemo<TurnStats | null>(() => {
+    version() // track
+    const msgs = props.api.state.session.messages(props.sessionID) as unknown as RawMessage[] || []
+    const session = props.api.state.session.get(props.sessionID) as any
+    return computeTurnStats(msgs, session?.cost ?? 0)
   })
 
   const toggle = () => setCollapsed((v) => !v)
+  const t = () => theme()
+  const labelW = 11
 
-  // Single return with <Show> — NO early returns
   return (
-    <Show
-      when={!collapsed()}
-      fallback={
-        <box flexDirection="column" paddingTop={1} paddingBottom={1}>
-          <box
-            flexDirection="row"
-            gap={1}
-            onMouseDown={toggle}
-            onKeyDown={(e: any) => {
-              if (e.name === "return" || e.name === "space") { e.preventDefault(); toggle() }
-            }}
-          >
-            <text style={{ fg: theme().textMuted }}>{"\u25B6"}</text>
-            <text style={{ fg: theme().text }}>Token Stats</text>
-            <Show when={stats()}>
-              {(s) => (
-                <text style={{ fg: theme().textMuted }}>
-                  {"  " + fmt(s().contextSize) + " ctx"}
-                </text>
-              )}
-            </Show>
-          </box>
-        </box>
-      }
-    >
-      {/* Expanded view */}
-      <box flexDirection="column" paddingTop={1} paddingBottom={1}>
-        {/* Header */}
-        <box
-          flexDirection="row"
-          gap={1}
-          onMouseDown={toggle}
-          onKeyDown={(e: any) => {
-            if (e.name === "return" || e.name === "space") { e.preventDefault(); toggle() }
-          }}
-        >
-          <text style={{ fg: theme().textMuted }}>{"\u25BC"}</text>
-          <text style={{ fg: theme().text, fontWeight: "bold" }}>Token Stats</text>
-          <Show when={generating()}>
-            <text style={{ fg: theme().accent }}>{" \u00B7 generating"}</text>
-          </Show>
-        </box>
+    <box flexDirection="column" paddingTop={1} paddingBottom={1}>
+      {/* Header — click to toggle */}
+      <box
+        flexDirection="row"
+        gap={1}
+        onMouseDown={() => setCollapsed((v) => !v)}
+      >
+        <text style={{ fg: t().textMuted }}>{collapsed() ? "\u25B6" : "\u25BC"}</text>
+        <text style={{ fg: t().text }}>Token Stats</text>
+      </box>
 
-        {/* Stats content */}
+      <Show when={!collapsed()}>
         <Show
           when={stats()}
-          fallback={<text style={{ fg: theme().textMuted }}>{"  awaiting response..."}</text>}
+          fallback={
+            <text style={{ fg: t().textMuted }}>{"  waiting for response..."}</text>
+          }
         >
-          {(s) => {
-            const labelStyle = () => ({ fg: theme().textMuted })
-            const valStyle = () => ({ fg: theme().text })
-
-            return (
-              <box flexDirection="column">
-                {/* Context */}
-                <box flexDirection="row">
-                  <text style={labelStyle()}>{pad("  Context", 12)}</text>
-                  <text style={valStyle()}>{fmt(s().contextSize)}</text>
-                  <Show when={s().cacheRead > 0}>
-                    <text style={labelStyle()}>{" (" + fmt(s().cacheRead) + " cached)"}</text>
-                  </Show>
-                </box>
-
-                {/* Input */}
-                <box flexDirection="row">
-                  <text style={labelStyle()}>{pad("  Input", 12)}</text>
-                  <text style={valStyle()}>{s().inputTokens.toLocaleString()}</text>
-                </box>
-
-                {/* Output */}
-                <box flexDirection="row">
-                  <text style={labelStyle()}>{pad("  Output", 12)}</text>
-                  <text style={valStyle()}>{s().outputTokens.toLocaleString()}</text>
-                </box>
-
-                {/* Reasoning */}
-                <Show when={s().reasoningTokens > 0}>
-                  <box flexDirection="row">
-                    <text style={labelStyle()}>{pad("  Reasoning", 12)}</text>
-                    <text style={valStyle()}>{s().reasoningTokens.toLocaleString()}</text>
-                  </box>
+          {(s) => (
+            <box flexDirection="column">
+              {/* ── Last Response ── */}
+              <box flexDirection="row">
+                <text style={{ fg: t().textMuted }}>{pad("  Context", labelW)}</text>
+                <text style={{ fg: t().text }}>{fmt(s().lastContext)}</text>
+                <Show when={s().lastCacheRead > 0}>
+                  <text style={{ fg: t().textMuted }}>{"  " + fmt(s().lastCacheRead) + " cached"}</text>
                 </Show>
-
-                {/* Separator */}
-                <text style={labelStyle()}>{"  \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"}</text>
-
-                {/* Speed */}
-                <box flexDirection="row">
-                  <text style={labelStyle()}>{pad("  Speed", 12)}</text>
-                  <Show
-                    when={tps() > 0.5}
-                    fallback={<text style={labelStyle()}>{"idle"}</text>}
-                  >
-                    <text
-                      style={{
-                        fg: tps() > 50 ? theme().success : tps() > 15 ? theme().warning : theme().textMuted,
-                      }}
-                    >
-                      {fmtTps(tps()) + " tok/s"}
-                    </text>
-                  </Show>
-                </box>
-
-                {/* Cost */}
-                <box flexDirection="row">
-                  <text style={labelStyle()}>{pad("  Cost", 12)}</text>
-                  <text style={valStyle()}>{"$" + s().totalCost.toFixed(4)}</text>
-                </box>
-
-                {/* Model */}
-                <box flexDirection="row">
-                  <text style={labelStyle()}>{pad("  Model", 12)}</text>
-                  <text style={valStyle()}>{s().model}</text>
-                </box>
               </box>
-            )
-          }}
+
+              <box flexDirection="row">
+                <text style={{ fg: t().textMuted }}>{pad("  Input", labelW)}</text>
+                <text style={{ fg: t().text }}>{s().lastInput.toLocaleString()}</text>
+              </box>
+
+              <box flexDirection="row">
+                <text style={{ fg: t().textMuted }}>{pad("  Output", labelW)}</text>
+                <text style={{ fg: t().text }}>{s().lastOutput.toLocaleString()}</text>
+              </box>
+
+              <Show when={s().lastReasoning > 0}>
+                <box flexDirection="row">
+                  <text style={{ fg: t().textMuted }}>{pad("  Thinking", labelW)}</text>
+                  <text style={{ fg: t().text }}>{s().lastReasoning.toLocaleString()}</text>
+                </box>
+              </Show>
+
+              {/* ── Separator ── */}
+              <text style={{ fg: t().textMuted }}>{"  \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"}</text>
+
+              {/* ── Performance ── */}
+              <Show when={s().lastDurationMs > 0}>
+                <box flexDirection="row">
+                  <text style={{ fg: t().textMuted }}>{pad("  Duration", labelW)}</text>
+                  <text style={{ fg: t().text }}>{fmtDur(s().lastDurationMs)}</text>
+                </box>
+              </Show>
+
+              <Show when={s().lastTps > 0}>
+                <box flexDirection="row">
+                  <text style={{ fg: t().textMuted }}>{pad("  Speed", labelW)}</text>
+                  <text
+                    style={{
+                      fg: s().lastTps > 50 ? t().success : s().lastTps > 15 ? t().warning : t().textMuted,
+                    }}
+                  >
+                    {fmtTps(s().lastTps) + " tok/s"}
+                  </text>
+                </box>
+              </Show>
+
+              {/* ── Session ── */}
+              <text style={{ fg: t().textMuted }}>{"  \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"}</text>
+
+              <box flexDirection="row">
+                <text style={{ fg: t().textMuted }}>{pad("  Total out", labelW)}</text>
+                <text style={{ fg: t().text }}>{s().totalOutput.toLocaleString()}</text>
+              </box>
+
+              <box flexDirection="row">
+                <text style={{ fg: t().textMuted }}>{pad("  Total cost", labelW)}</text>
+                <text style={{ fg: t().text }}>{fmtCost(s().totalCost)}</text>
+              </box>
+
+              <box flexDirection="row">
+                <text style={{ fg: t().textMuted }}>{pad("  Turns", labelW)}</text>
+                <text style={{ fg: t().text }}>{String(s().turnCount)}</text>
+              </box>
+
+              <box flexDirection="row">
+                <text style={{ fg: t().textMuted }}>{pad("  Model", labelW)}</text>
+                <text style={{ fg: t().textMuted }}>{s().lastModel}</text>
+              </box>
+            </box>
+          )}
         </Show>
-      </box>
-    </Show>
+      </Show>
+    </box>
   )
 }
 
