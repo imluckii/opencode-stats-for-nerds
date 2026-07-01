@@ -38,11 +38,40 @@ const DEFAULT_VISIBILITY: StatVisibility = {
   model: true,
 }
 
-function resolveVisibility(options: unknown): StatVisibility {
-  if (!options || typeof options !== "object") return { ...DEFAULT_VISIBILITY }
-  const show = (options as PluginOptions).show
-  if (!show || typeof show !== "object") return { ...DEFAULT_VISIBILITY }
-  return { ...DEFAULT_VISIBILITY, ...show }
+function extractShow(obj: unknown): Partial<StatVisibility> | null {
+  if (!obj || typeof obj !== "object") return null
+  const show = (obj as PluginOptions).show
+  if (!show || typeof show !== "object") return null
+  return show as Partial<StatVisibility>
+}
+
+function resolveVisibility(
+  options: unknown,
+  tuiConfig: { plugin?: ReadonlyArray<string | readonly [string, unknown]> } | undefined,
+): StatVisibility {
+  // 1. Try options passed directly to the plugin function
+  const direct = extractShow(options)
+  if (direct) return { ...DEFAULT_VISIBILITY, ...direct }
+
+  // 2. Scan tuiConfig.plugin array — works even when plugin loaded via file://
+  //    but options are in a separate tuple entry
+  const plugins = tuiConfig?.plugin
+  if (plugins) {
+    for (const entry of plugins) {
+      if (Array.isArray(entry) && entry.length >= 2) {
+        const [id, opts] = entry
+        if (
+          typeof id === "string" &&
+          (id === PLUGIN_ID || id.includes("opencode-stats-for-nerds"))
+        ) {
+          const extracted = extractShow(opts)
+          if (extracted) return { ...DEFAULT_VISIBILITY, ...extracted }
+        }
+      }
+    }
+  }
+
+  return { ...DEFAULT_VISIBILITY }
 }
 
 // ── Helpers ──
@@ -154,15 +183,7 @@ function computeStats(
     (m) => m.role === "assistant" && m.tokens && (m.tokens.output || 0) > 0,
   )
 
-  if (assistants.length === 0) {
-    // Check if there are any assistant messages at all (even in-progress)
-    const anyAssistant = messages.find((m) => m.role === "assistant")
-    if (anyAssistant) {
-      // In progress — return null to show "generating..."
-      return null
-    }
-    return null
-  }
+  if (assistants.length === 0) return null
 
   let totalInput = 0
   let totalOutput = 0
@@ -283,15 +304,26 @@ function StatsView(props: {
 
   const stop1 = props.api.event.on("message.updated", (e: any) => {
     if (e.properties?.sessionID !== props.sessionID) return
-    setTick((v) => v + 1)
+    setTick((v: number) => v + 1)
   })
   const stop2 = props.api.event.on("session.idle", (e: any) => {
-    const sid = e.properties?.id || e.properties?.sessionID
-    if (sid !== props.sessionID) return
-    setTick((v) => v + 1)
+    if (e.properties?.sessionID !== props.sessionID) return
+    setTick((v: number) => v + 1)
   })
 
   onCleanup(() => { stop1(); stop2() })
+
+  // Cache last good stats so sidebar doesn't blank out during generation
+  let cached: Stats | null = null
+  const isGenerating = createMemo(() => {
+    tick()
+    const msgs = props.api.state.session.messages(props.sessionID) as unknown as RawMessage[] || []
+    // Check if the last assistant message is incomplete (no output tokens yet)
+    const lastAssistant = [...msgs].reverse().find((m) => m.role === "assistant")
+    if (!lastAssistant) return false
+    const tk = lastAssistant.tokens
+    return !tk || !tk.output
+  })
 
   const stats = createMemo<Stats | null>(() => {
     tick()
@@ -305,7 +337,16 @@ function StatsView(props: {
     }
 
     const diff = props.api.state.session.diff(props.sessionID) as unknown as FileChange[] || []
-    return computeStats(msgs, session?.cost ?? 0, diff, ctxLimit)
+    const result = computeStats(msgs, session?.cost ?? 0, diff, ctxLimit)
+    if (result) cached = result
+    return result
+  })
+
+  // Reactive view of stats — falls back to cached during generation
+  const displayStats = createMemo<Stats | null>(() => {
+    stats() // track
+    if (cached) return cached
+    return null
   })
 
   const v = props.visibility
@@ -318,11 +359,14 @@ function StatsView(props: {
       <box flexDirection="row" gap={1} onMouseDown={() => setCollapsed((c) => !c)}>
         <text style={{ fg: t().textMuted }}>{collapsed() ? "\u25B6" : "\u25BC"}</text>
         <text style={{ fg: t().text, fontWeight: "bold" }}>Stats for Nerds</text>
+        <Show when={isGenerating()}>
+          <text style={{ fg: t().textMuted, fontStyle: "italic" }}>generating...</text>
+        </Show>
       </box>
 
       <Show when={!collapsed()}>
         <Show
-          when={stats()}
+          when={displayStats()}
           fallback={<text style={{ fg: t().textMuted }}>{L + "waiting..."}</text>}
         >
           {(s) => (
@@ -479,7 +523,7 @@ function StatsView(props: {
 // ── Plugin ──
 
 const tui: TuiPlugin = async (api, options) => {
-  const visibility = resolveVisibility(options)
+  const visibility = resolveVisibility(options, api.tuiConfig as any)
 
   api.slots.register({
     order: 200,
