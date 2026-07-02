@@ -100,24 +100,24 @@ interface FileChange {
 }
 
 interface Stats {
-  // cumulative
-  totalInput: number
-  totalOutput: number
-  totalReasoning: number
-  // last-turn cache (how much of current context is cached)
+  // token breakdown of current context (all last-turn snapshot)
+  lastInput: number
+  lastOutput: number
+  lastThinking: number
   lastCached: number
   // context (last message)
   contextUsed: number
   contextLimit: number
   contextPercent: number
-  // cost
+  // cost (cumulative)
   totalCost: number
-  // timing
+  // timing (cumulative)
   activeTimeMs: number
   thinkTimeMs: number
+  // timing (last-turn)
   lastTtft: number | null
   lastTps: number
-  // activity
+  // activity (cumulative)
   stepCount: number
   toolCallCount: number
   // files
@@ -157,9 +157,6 @@ function computeStats(
 
   if (assistants.length === 0) return null
 
-  let totalInput = 0
-  let totalOutput = 0
-  let totalReasoning = 0
   let totalCost = 0
   let activeTimeMs = 0
   let thinkTimeMs = 0
@@ -167,10 +164,6 @@ function computeStats(
   let toolCallCount = 0
 
   for (const m of assistants) {
-    const tk = m.tokens!
-    totalInput += tk.input || 0
-    totalOutput += tk.output || 0
-    totalReasoning += tk.reasoning || 0
     totalCost += m.cost || 0
 
     if (m.time?.created && m.time?.completed) {
@@ -235,9 +228,9 @@ function computeStats(
   const lastCached = (lastTk.cache?.read || 0) + (lastTk.cache?.write || 0)
 
   return {
-    totalInput,
-    totalOutput,
-    totalReasoning,
+    lastInput: lastTk.input || 0,
+    lastOutput: lastTk.output || 0,
+    lastThinking: lastTk.reasoning || 0,
     lastCached,
     contextUsed,
     contextLimit,
@@ -362,16 +355,16 @@ function StatsView(props: {
               <Show when={v.tokens}>
                 <box flexDirection="row">
                   <text style={{ fg: t().textMuted }}>{L + "Input" + GAP}</text>
-                  <text style={{ fg: t().text }}>{fmt(s().totalInput)}</text>
+                  <text style={{ fg: t().text }}>{fmt(s().lastInput)}</text>
                 </box>
                 <box flexDirection="row">
                   <text style={{ fg: t().textMuted }}>{L + "Output" + GAP}</text>
-                  <text style={{ fg: t().text }}>{fmt(s().totalOutput)}</text>
+                  <text style={{ fg: t().text }}>{fmt(s().lastOutput)}</text>
                 </box>
-                <Show when={s().totalReasoning > 0}>
+                <Show when={s().lastThinking > 0}>
                   <box flexDirection="row">
                     <text style={{ fg: t().textMuted }}>{L + "Thinking" + GAP}</text>
-                    <text style={{ fg: t().text }}>{fmt(s().totalReasoning)}</text>
+                    <text style={{ fg: t().text }}>{fmt(s().lastThinking)}</text>
                   </box>
                 </Show>
               </Show>
